@@ -3,6 +3,9 @@ from requests import get
 
 
 class Headers():
+    '''
+    This class uses scrapeops api to get us a random header
+    '''
     def __init__(self):
         scrape_ops_api_key = "ff840f76-d916-4fb0-9e07-113d68efb74c"
         response = get(
@@ -18,6 +21,10 @@ class Headers():
         
 
 class Proxies():
+    '''
+    This class uses proxyscrape's api to generate and gets us random proxies
+    '''
+
     def __init__(self):
         url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"
         p = get(url)
