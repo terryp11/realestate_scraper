@@ -16,6 +16,9 @@ class Headers():
         self.header_list = response.json()['result']
 
     def get(self):
+        '''
+        Grabs a random http header from the generated list of headers
+        '''
         header = random.choice(self.header_list)
         return header
         
@@ -32,6 +35,9 @@ class Proxies():
         self.proxy_list = p.text.split('\r\n')
 
     def get(self):
+        '''
+        Grabs a random proxy from the generated list of proxies
+        '''
         proxy = random.choice(self.proxy_list)
         return proxy
 

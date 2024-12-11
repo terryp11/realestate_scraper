@@ -1,249 +1,185 @@
 from bs4 import BeautifulSoup
-from requests import Session, RequestException
+from requests import Session, RequestException, get
 from json import loads
 from html import unescape
-from typing import Optional
+from typing import Optional, Generator, Union
 from datetime import datetime
 from headers import Headers, Proxies
 import sqlite3
 
+class ZillowScraper():
 
-def scrape_page(session: Session, url: str) -> list:
-    '''
-    Generator to yield scraped properties on each page 
 
-    Args:
-        session (Session): requests session to maintain continuity across requests
-        url (str): Zillow URL to scrape
+    def __init__(self):
+        self.headers = Headers()
+        self.session = None
+        self.db = None
+        self.total_properties = 0
+        self.pages = []
+        self.data = []
+    
 
-    Yields:
-        list: List containing all of the scraped properties, each as a dictionary (JSON).
-              Prints the number of pages scraped and the total number of properties scraped.
-    '''
-    
-    pages = [url]
-    
-    # Initial request, checks if the response is successful
-    response = session.get(url)
-    
-    if response.status_code == 200:
-        soup = BeautifulSoup(response.content, "html.parser").select("#__NEXT_DATA__")
-        page_data = loads(soup[0].getText())['props']['pageProps']['searchPageState']['cat1']
+    def scrape_page(self, url: str):
+        """
+        Scrape data from Zillow and yield each property as it is found.
+        """
+        self.pages.append(url)
         
-        # Yield cleaned data for each property on the first page
-        properties = page_data['searchResults']['listResults']
+        # Initial request, checks if the response is successful
+        if self.session:
+            response = self.session.get(url)
+        else:
+            response = get(url, headers = self.headers.get())
         
-        for property_info in properties:
-            yield property_info
-
-        # Handle pagination
-        pagination = page_data['searchList']['pagination']
-        while pagination and 'nextUrl' in pagination:
-            next_url = 'https://www.zillow.com' + pagination['nextUrl']
-            response = session.get(next_url)
-            pages.append(next_url)
-            soup = BeautifulSoup(response.content, "html.parser").select("#__NEXT_DATA__")
-            page_data = loads(soup[0].getText())['props']['pageProps']['searchPageState']['cat1']
+        if response.status_code == 200:
+            properties, pagination = self._parse_page(response)
             
-            # Yield cleaned data for each property on each subsequent page
-            properties = page_data['searchResults']['listResults']
+            # Yield data from page
             for property_info in properties:
                 yield property_info
+            
+            # Starts request for the next page if there is one
+            while pagination and 'nextUrl' in pagination:
+                next_url = 'https://www.zillow.com' + pagination['nextUrl']
+                self.pages.append(next_url)
+                response = self.session.get(next_url)
 
-            pagination = page_data['searchList']['pagination']
+                properties, pagination = self._parse_page(response)
+                
+                # Yield data from page
+                for property_info in properties:
+                    yield property_info
 
-        print(f"{len(pages)} pages from {url}")
-
-
-
-
-def clean_data(property_info : dict) -> dict:
-    '''
-    Cleans a dictionary of property data and returns a new dictionary
-    containing only the important features, including a custom calculated
-    features and formatted dates.
-
-    Args:
-        property_info (dict): input dictionary with property info (json)
-
-    Returns:
-        dict: dictionary containing these house features
-              (zpid, streetaddress, city, statezipcode,
-               price, sqft, price_per_sqft, home_type,
-               date_sold, bath, bed, lot_area, lot_area_unit,
-               link, latitude, longitude, date_scraped)
-    '''
-
-    house = property_info
-
-    info = {
-        "zpid": house.get('hdpData', {}).get('homeInfo', {}).get('zpid'),
-        "streetaddress": house.get('addressStreet'),
-        "city": house.get('addressCity'),
-        "state": house.get('addressState'),
-        "zipcode": house.get('addressZipcode'),
-        "home_status": house.get('statusType'),
-        "price": house.get('hdpData', {}).get('homeInfo', {}).get('price'),
-        "sqft": house.get('hdpData', {}).get('homeInfo', {}).get('livingArea'),
-        "price_per_sqft": (house.get('hdpData', {}).get('homeInfo', {}).get('price') /
-                           (house.get('hdpData', {}).get('homeInfo', {}).get('livingArea'))
-                           if house.get('hdpData', {}).get('homeInfo', {}).get('price') and
-                           house.get('hdpData', {}).get('homeInfo', {}).get('livingArea') else None),
-        "home_type": house.get('hdpData', {}).get('homeInfo', {}).get('homeType'),
-        "date_sold": (datetime.fromtimestamp(house.get('hdpData', {}).get('homeInfo', {}).get('dateSold') /
-                      1000).strftime("%Y-%m-%d") if house.get('hdpData', {}).get('homeInfo', {}).get('dateSold') else None),
-        "bath": house.get('hdpData', {}).get('homeInfo', {}).get('bathrooms'),
-        "bed": house.get('hdpData', {}).get('homeInfo', {}).get('bedrooms'),
-        "lot_area" : house.get('hdpData', {}).get('homeInfo', {}).get('livingArea'),
-        "lot_area_unit": house.get('hdpData', {}).get('homeInfo', {}).get('lotAreaUnit'),
-        "link": house.get('detailUrl'),
-        "latitude": house.get('latLong', {}).get('latitude'),
-        "longitude": house.get('latLong', {}).get('longitude'),
-        "date_scraped": datetime.now().strftime("%Y-%m-%d")
-    }
-    return info
+            print(f"{len(self.pages)} pages from {url}")
 
 
+    def _parse_page(self, response):
+        '''
+        Parses page using BeautifulSoup and returns page data regarding
+        properties and pagination
+        '''
 
-def get_properties(session: Session, zipcode: int) -> list:
-    """
-    Scrapes and cleans properties from both for sale and sold pages
+        soup = BeautifulSoup(response.content, "html.parser").select("#__NEXT_DATA__")
+        page_data = loads(soup[0].getText())['props']['pageProps']['searchPageState']['cat1']
 
-    Args:
-        session (requests.Session): Requests session
-        zipcode (int): 5-digit zipcode
+        properties = page_data['searchResults']['listResults']
+        pagination = page_data['searchList']['pagination']
 
-    Returns:
-        list: list containing dictionaries of cleaned data
-    """
-
-    data = []
-
-    for_sale_url = f"https://www.zillow.com/{zipcode}"
-    sold_url = f"https://www.zillow.com/{zipcode}/sold"
-
-    
-    # scrapes from url, and cleans the data
-    for url in [for_sale_url, sold_url]:
-        for property_info in scrape_page(session, url):
-            data.append(clean_data(property_info))
-    
-    return data
+        return properties, pagination
 
 
-
-def ingest_to_db(db_name: str, data: list):
-    """
-    Inserts cleaned property data into an SQLite database.
-
-    Args:
-        db_name (str): database name 
-        data (list): a list containing cleaned property data
-    
-    """
-    # Create connection to the database
-    conn = sqlite3.connect(db_name)
-    cursor = conn.cursor()
-    
-    # Create table if it doesn't exist
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS properties (
-            zpid TEXT PRIMARY KEY,
-            streetaddress TEXT,
-            city TEXT,
-            state TEXT,
-            zipcode TEXT,
-            home_status TEXT,
-            price REAL,
-            sqft REAL,
-            price_per_sqft REAL,
-            home_type TEXT,                  
-            date_sold TEXT,
-            bath REAL,
-            bed REAL,
-            lot_area REAL,                 
-            lot_area_unit TEXT,
-            link TEXT,
-            latitude REAL,
-            longitude REAL,
-            date_scraped TEXT
-        )
-    ''')
-    
-    # Insert data
-    cursor.executemany('''
-        INSERT OR REPLACE INTO properties VALUES (
-            :zpid, :streetaddress, :city, :state, :zipcode, :home_status,
-            :price, :sqft, :price_per_sqft, :home_type, :date_sold,
-            :bath, :bed, :lot_area, :lot_area_unit, :link,
-            :latitude, :longitude, :date_scraped
-        )
-    ''', data)
-    
-    conn.commit()
-    conn.close()
+    def _clean_data(self, data: dict) -> dict:
+        info = {
+            "zpid": data.get('hdpData', {}).get('homeInfo', {}).get('zpid'),
+            "streetaddress": data.get('addressStreet'),
+            "city": data.get('addressCity'),
+            "state": data.get('addressState'),
+            "zipcode": data.get('addressZipcode'),
+            "home_status": data.get('statusType'),
+            "price": data.get('hdpData', {}).get('homeInfo', {}).get('price'),
+            "sqft": data.get('hdpData', {}).get('homeInfo', {}).get('livingArea'),
+            "price_per_sqft": (data.get('hdpData', {}).get('homeInfo', {}).get('price') /
+                            (data.get('hdpData', {}).get('homeInfo', {}).get('livingArea'))
+                            if data.get('hdpData', {}).get('homeInfo', {}).get('price') and
+                            data.get('hdpData', {}).get('homeInfo', {}).get('livingArea') else None),
+            "home_type": data.get('hdpData', {}).get('homeInfo', {}).get('homeType'),
+            "date_sold": (datetime.fromtimestamp(data.get('hdpData', {}).get('homeInfo', {}).get('dateSold') /
+                        1000).strftime("%Y-%m-%d") if data.get('hdpData', {}).get('homeInfo', {}).get('dateSold') else None),
+            "bath": data.get('hdpData', {}).get('homeInfo', {}).get('bathrooms'),
+            "bed": data.get('hdpData', {}).get('homeInfo', {}).get('bedrooms'),
+            "lot_area" : data.get('hdpData', {}).get('homeInfo', {}).get('livingArea'),
+            "lot_area_unit": data.get('hdpData', {}).get('homeInfo', {}).get('lotAreaUnit'),
+            "link": data.get('detailUrl'),
+            "latitude": data.get('latLong', {}).get('latitude'),
+            "longitude": data.get('latLong', {}).get('longitude'),
+            "date_scraped": datetime.now().strftime("%Y-%m-%d")
+        }
+        return info
 
 
+    def _get_properties(self, area: Union[str, int]) -> list:
 
-def zillow_zipcode_to_db(zipcode: int, db_name: str = "zillow_data.db"):
-    '''
-    Scrapes zillow for sold and for sale properties and ingests it
-    into a SQLite database
+        # Preparing the urls for for sale and sold zillow pages
+        for_sale_url = f"https://www.zillow.com/{area}"
+        sold_url = f"https://www.zillow.com/{area}/sold"
 
-    Args:
-        zipcode (int): 5-digit US zipcode
-        db_name (str): a specified database name
-    '''
-    headers = Headers()
-    
-    with Session() as session:
-        session.headers.update(headers.get())
         
-        # Get and clean properties
-        data = get_properties(session, zipcode)
+        # Scrapes from url, and cleans the data
+        for url in [for_sale_url, sold_url]:
+            for property_info in self.scrape_page(url):
+                self.data.append(self._clean_data(property_info))
+
+
+    def _ingest_to_db(self) -> None:
+        conn = sqlite3.connect(self.db)
+        cursor = conn.cursor()
         
-        # Ingest into the database
-        ingest_to_db(db_name, data)
+        # Create table if it doesn't exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS properties (
+                zpid TEXT PRIMARY KEY,
+                streetaddress TEXT,
+                city TEXT,
+                state TEXT,
+                zipcode TEXT,
+                home_status TEXT,
+                price REAL,
+                sqft REAL,
+                price_per_sqft REAL,
+                home_type TEXT,                  
+                date_sold TEXT,
+                bath REAL,
+                bed REAL,
+                lot_area REAL,                 
+                lot_area_unit TEXT,
+                link TEXT,
+                latitude REAL,
+                longitude REAL,
+                date_scraped TEXT
+            )
+        ''')
+        
+        # Insert data
+        cursor.executemany('''
+            INSERT OR REPLACE INTO properties VALUES (
+                :zpid, :streetaddress, :city, :state, :zipcode, :home_status,
+                :price, :sqft, :price_per_sqft, :home_type, :date_sold,
+                :bath, :bed, :lot_area, :lot_area_unit, :link,
+                :latitude, :longitude, :date_scraped
+            )
+        ''', self.data)
 
-    print(f"Ingested {len(data)} properties into {db_name}")
+        print(f"Ingested {len(self.data)} rows into {self.db}")
+
+        # Keep count of properties scraped
+        self.total_properties += len(self.data)
+        self.data = []
+        conn.commit()
+        conn.close()
 
 
-
-
-def scrape_zillow_city(city: str, state: str) -> list:
-    '''
-    Scrapes a Zillow city page of both sold and for sale properties,
-    collecting data across all paginated pages using the same session.
-
-    Args: 
-        city (str): city
-        state (str): 2 character state code
-
-    Returns:
-        list: List containing cleaned property data for all scraped properties
-    '''
-
-    headers = Headers()
-    cleaned_data = []
-
-    for_sale_url = f"https://www.zillow.com/{city}-{state}"
-    sold_url = f"https://www.zillow.com/{city}-{state}/sold"
+    def set_db(self, db: str) -> None:
+        self.db = db
+        print(f"Set database to {db}")
     
-    # Create a session to scrape both URLs
-    with Session() as session:
-        session.headers.update(headers.get())  # Set headers for the session
-        
-        # Scrape for sale and sold properties using the same session
-        for_sale_data = scrape_page(session, for_sale_url)
-        sold_data = scrape_page(session, sold_url)
-        
-        # Combine the data
-        data = sold_data + for_sale_data
 
-        # Clean data for each property
-        for property in data:
-            cleaned_data.append(clean_data(property))
+    def scrape_zipcode_to_db(self, zipcode: int):
+        if not self.db:
+            raise AttributeError("No database set. Set data base with set_db()")
+        self.headers = Headers()
+        self.session = Session()
+        self.session.headers.update(self.headers.get())
+        self._get_properties(zipcode)
+        self._ingest_to_db()
+        self.pages = []
 
-    print(f"Total of {len(cleaned_data)} properties scraped!")
-
-    return cleaned_data
+    
+    def scrape_city_to_db(self, city: str, state: str):
+        if not self.db:
+            raise AttributeError("No database set. Set data base with set_db()")
+        self.headers = Headers()
+        self.session = Session()
+        self.session.headers.update(self.headers.get())
+        self._get_properties(f"{city}-{state}")
+        self._ingest_to_db()
+        self.pages = []
